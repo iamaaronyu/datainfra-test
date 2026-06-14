@@ -35,6 +35,13 @@ class Config:
     safety_headroom: float = _float("CP_SAFETY_HEADROOM", 0.05)  # 供给侧保留水位
     load_cost_k: int = _int("CP_LOAD_COST_K", 5)                 # 加载成本门槛倍数
 
+    # 三池模型（架构 §4.3，决策三）
+    total_cards: int = _int("CP_TOTAL_CARDS", 5000)              # 试点机房总卡（贵阳 ~5000）
+    online_reserved_cards: int = _int("CP_ONLINE_RESERVED", 3000)  # 在线保障池（含排空余量）
+    # 抢占排空余量：在线拿卡要等离线在 batch 边界优雅退出，这段时延须计入在线保障池
+    # （review 🟢5）。在线保障池 = 在线峰值 + ceil(峰值斜率 × 排空时延)。
+    preempt_drain_seconds: int = _int("CP_PREEMPT_DRAIN_SECONDS", 120)  # SIGTERM grace
+
     # 计量结算（§8）—— 价格杠杆
     base_price_per_card_hour: float = _float("CP_BASE_PRICE", 10.0)
     b3_price_factor: float = _float("CP_B3_FACTOR", 1.5)   # B3 更强，单价更高

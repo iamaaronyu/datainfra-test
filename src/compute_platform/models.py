@@ -9,11 +9,16 @@ from enum import Enum
 
 
 class QoS(str, Enum):
-    """服务质量分级（§7.1）。决定调度优先级与计费倍率。"""
+    """服务质量分级 —— 三池模型（架构 §4.3，决策三）。决定抢占资格与计费倍率。
 
-    GUARANTEED = "guaranteed"          # 在线：独占、不可抢、全价
-    PREEMPTIBLE = "preemptible"        # 离线可抢：填空闲、随时让路、折价
-    BEST_EFFORT_FIXED = "best_effort"  # 离线不改造：固定低配额、不进混部、全价
+    三池：在线保障池(GUARANTEED) + 离线保障配额池(PROTECTED) + 弹性/突发池(PREEMPTIBLE)。
+    在线扩容只抢「弹性/突发池」，离线配额内(PROTECTED)与在线(GUARANTEED)均不可抢。
+    """
+
+    GUARANTEED = "guaranteed"          # 在线保障池：独占、不可抢、全价
+    PROTECTED = "protected"            # 离线保障配额池：配额内、全价、不可抢（在线也不抢）
+    PREEMPTIBLE = "preemptible"        # 弹性/突发池：离线超配额、折价、先被抢、也用于填谷
+    BEST_EFFORT_FIXED = "best_effort"  # 不改造固定池：不进混部、固定全价（历史兼容）
 
 
 class CardType(str, Enum):

@@ -14,10 +14,12 @@ from dataclasses import dataclass
 
 from ..config import Config
 from ..governance.quota import QuotaManager, QuotaExceeded
+from ..governance.lineage import LineageRegistry, DatasetVersion
 from ..models import Job, JobStatus, QoS
 from ..objectstore import LocalObjectStore
 from ..queue.base import ShardQueue
 from ..registry import ModelRegistry
+from ..scheduler.locality import resolve_placement, LocalityViolation
 from ..sharder import Sharder
 
 
@@ -36,6 +38,12 @@ class SubmitRequest:
     prompt_template: str = ""
     qos: QoS = QoS.PREEMPTIBLE
     client_token: str | None = None
+    # 数据治理 / 局部性（v2.0，§5、§5.1）—— 均可选，留空则退化为 v1.0 行为
+    dataset: str | None = None              # 逻辑数据集名（多轮版本链所属）
+    round: int = 0                          # 生产轮次
+    dataset_region: str | None = None       # 输入数据物理域；设置后强制就近调度
+    input_versions: tuple[str, ...] = ()    # 上游 DataHub 版本（血缘 parents）
+    allow_cross_region: bool = False
 
 
 _JOBS_SCHEMA = """
@@ -129,14 +137,20 @@ class JobStore:
 class BatchService:
     def __init__(self, config: Config, store: LocalObjectStore, queue: ShardQueue,
                  registry: ModelRegistry, job_store: JobStore,
-                 quota: QuotaManager | None = None):
+                 quota: QuotaManager | None = None,
+                 lineage: LineageRegistry | None = None,
+                 ray_clusters: dict[str, bool] | None = None):
         self.config = config
         self.store = store
         self.queue = queue
         self.registry = registry
         self.jobs = job_store
         self.quota = quota
+        self.lineage = lineage              # DataHub 替身：血缘/版本链
+        self.ray_clusters = ray_clusters    # {region: 可用} —— 启用数据局部性强制
         self.sharder = Sharder(store, config)
+        # 记住每个作业的治理上下文，供完成时回写血缘（DataHub 闭环）
+        self._job_meta: dict[str, dict] = {}
 
     def submit(self, tenant: str, req: SubmitRequest) -> Job:
         # 幂等：同 client_token 直接返回已有作业
@@ -156,6 +170,20 @@ class BatchService:
                 raise ValidationError(
                     429, f"quota insufficient for tenant={tenant}")
 
+        # 数据局部性硬约束（§5.1）：声明了 region 且启用了 ray_clusters → 强制就近
+        if req.dataset_region is not None and self.ray_clusters is not None:
+            try:
+                resolve_placement(
+                    req.dataset_region, self.ray_clusters,
+                    allow_cross_region=req.allow_cross_region)
+            except LocalityViolation as e:
+                raise ValidationError(409, str(e))
+
+        # 提交时固化上游版本（§5.2 task×DataHub 闭环：读输入版本/血缘）
+        if self.lineage is not None:
+            for v in req.input_versions:
+                self.lineage.get(v)  # 不存在则抛 LineageError，杜绝血缘断裂
+
         template_hash = hashlib.sha256(req.prompt_template.encode()).hexdigest()[:16]
         job = Job(
             job_id="job-" + uuid.uuid4().hex[:12],
@@ -165,6 +193,15 @@ class BatchService:
             qos=req.qos, created_at=time.time())
         self.jobs.insert(job)
 
+        # 记住治理上下文（完成时回写血缘）
+        self._job_meta[job.job_id] = {
+            "dataset": req.dataset or req.output_prefix,
+            "round": req.round,
+            "region": req.dataset_region or "",
+            "input_versions": tuple(req.input_versions),
+            "template_hash": template_hash,
+        }
+
         # 切分入队（MVP 同步切分；亿级可异步化）
         shards = self.sharder.split(job.job_id, req.model, req.input_key, spec)
         self.queue.enqueue_many(shards)
@@ -173,6 +210,29 @@ class BatchService:
         job.status = JobStatus.RUNNING
         job.total_shards = len(shards)
         return job
+
+    def complete(self, job_id: str, params_hash: str = "") -> DatasetVersion | None:
+        """作业完成回写一条血缘边到 DataHub（§5.2 闭环、§5.3 版本链）。
+
+        输入版本 →[作业:模型+模板+参数]→ 输出版本。未配置 lineage 则跳过（返回 None）。
+        必须作业已成功（进度推导为 SUCCEEDED/COMPLETED_WITH_ERRORS）。
+        """
+        if self.lineage is None:
+            return None
+        job = self.jobs.get(job_id)
+        if job is None:
+            raise ValidationError(404, "job not found")
+        meta = self._job_meta.get(job_id)
+        if meta is None:
+            raise ValidationError(409, "missing governance context for job")
+        prog = self.progress(job_id)
+        if prog["status"] not in (JobStatus.SUCCEEDED.value,
+                                  JobStatus.COMPLETED_WITH_ERRORS.value):
+            raise ValidationError(409, f"job not finished: {prog['status']}")
+        return self.lineage.register(
+            dataset=meta["dataset"], round=meta["round"], region=meta["region"],
+            job_id=job_id, model=job.model, template_hash=meta["template_hash"],
+            params_hash=params_hash, parents=meta["input_versions"])
 
     def progress(self, job_id: str) -> dict:
         job = self.jobs.get(job_id)

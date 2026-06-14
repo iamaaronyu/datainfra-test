@@ -50,6 +50,22 @@ def test_guaranteed_full_price_b3():
     assert cost == pytest.approx(120.0)
 
 
+def test_protected_full_price_like_guaranteed():
+    m = MeteringService(_config())
+    # 离线配额内 PROTECTED 全价，与 Guaranteed 同价：8 * 10 * 1.5 = 120
+    prot = m.cost_of(UsageEvent("batch", CardType.B3, QoS.PROTECTED, 8, 3600))
+    guar = m.cost_of(UsageEvent("online", CardType.B3, QoS.GUARANTEED, 8, 3600))
+    assert prot == pytest.approx(120.0)
+    assert prot == pytest.approx(guar)
+
+
+def test_protected_more_expensive_than_preemptible():
+    m = MeteringService(_config())
+    prot = m.cost_of(UsageEvent("b", CardType.B3, QoS.PROTECTED, 8, 3600))
+    burst = m.cost_of(UsageEvent("b", CardType.B3, QoS.PREEMPTIBLE, 8, 3600))
+    assert burst < prot  # 价格杠杆：突发池更便宜，激励把活推进突发池
+
+
 def test_preemptible_discounted():
     m = MeteringService(_config())
     # 8 卡 B3 1 小时，可抢占 4 折：120 * 0.4 = 48

@@ -8,7 +8,8 @@
 | vLLM-Ascend / MindIE | `inference.MockEngine`（本地 in-process generate） |
 | 统一对象存储 | `objectstore.LocalObjectStore`（原子写 + range read） |
 | Redis / PostgreSQL 队列 | `queue.SqliteShardQueue`（BEGIN IMMEDIATE 原子 claim + 租约） |
-| Volcano / KEDA | `scheduler.controller` / `scheduler.preemption`（纯函数策略） |
+| Volcano / KEDA | `scheduler.controller` / `scheduler.preemption` / `scheduler.pools`（纯函数策略） |
+| DataHub（血缘/版本/region） | `governance.lineage.LineageRegistry`（进程内版本链） |
 
 详尽设计见《[算力服务化平台详细设计v1.0](./算力服务化平台详细设计v1.0.md)》。
 
@@ -44,16 +45,21 @@ src/compute_platform/
 │   └── sqlite_queue.py  #   SQLite 实现（Redis/PG 的替身）
 ├── scheduler/           # 调度核心（纯函数，便于测试）
 │   ├── controller.py    #   弹性伸缩：desired=min(积压,供给,配额)+加载门槛+末班车
-│   └── preemption.py    #   抢占 victim 选择：在线优先、先小后大、护新大实例
+│   ├── preemption.py    #   抢占 victim 选择：只抢突发池、先小后大、护新大实例
+│   ├── pools.py         #   三池模型（决策三）：在线保障/离线配额/弹性突发 + 配额打标
+│   ├── locality.py      #   数据局部性硬约束：PB 不跨域、强制就近
+│   └── fairshare.py     #   跨产线加权公平分配（注水法、整数守恒）
 ├── governance/          # 治理
-│   ├── quota.py         #   多租户配额硬边界
-│   └── metering.py      #   差异计量：卡型差价 + 可抢占折扣 + 被抢不计费
+│   ├── quota.py         #   多租户卡级配额硬边界
+│   ├── metering.py      #   差异计量：卡型差价 + 突发折扣 + 被抢不计费
+│   └── lineage.py       #   DataHub 替身：版本链 + 端到端血缘 + region
 └── batch_api/           # 离线作业接入（服务化边界=任务提交，非每次推理）
     ├── service.py       #   提交/进度/错误/取消/重试 + JobStore + 幂等
+    │                    #   + 数据局部性强制 + 完成回写血缘(task×DataHub 闭环)
     └── app.py           #   FastAPI 五接口
 ```
 
-## 测试覆盖（64 用例全绿）
+## 测试覆盖（102 用例全绿）
 
 | 文件 | 覆盖 |
 |---|---|
@@ -62,7 +68,12 @@ src/compute_platform/
 | test_sharder | 指针分片、粒度反推、范围正确、确定性 |
 | test_worker | 全量处理、幂等覆盖、毒分片→死信、优雅退出 |
 | test_controller | 积压/供给/配额三约束、加载成本门槛、潮汐末班车 |
-| test_preemption | 不抢 Guaranteed/Fixed、先小后大、护新大实例、尽力让路 |
-| test_governance | 配额 reserve/release/超限、差异计价、被抢不计费、按租户结算 |
+| test_preemption | 不抢 Guaranteed/Protected/Fixed、先小后大、护新大实例、三池只抢超配额 |
+| test_pools | 三池容量约束、配额内/跨界/超配打标、排空余量、负值防御 |
+| test_locality | 就近放置、本域故障拦截跨域、显式放行、缺 region 拒绝 |
+| test_fairshare | 按权重比例、want 封顶再分配、整数守恒、零卡/零权重 |
+| test_lineage | 版本登记、父版本校验、多轮链路回溯、latest、复现校验、跨产线多父 |
+| test_governance | 配额 reserve/release/超限、差异计价、Protected 全价、被抢不计费、按租户结算 |
 | test_batch_api | 提交、未知模型 400、配额 429、幂等 token、进度、错误/重试、取消、404 |
+| test_service_governance | 局部性拦截/放行、缺父版本拒绝、两轮血缘闭环、未完成禁 complete |
 | test_end_to_end | 单 worker 全链路、抢占后续跑不丢、4 worker 并发无重复无丢失 |

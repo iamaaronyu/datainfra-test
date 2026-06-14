@@ -1,8 +1,9 @@
 """计量结算（§8）—— 价格杠杆。
 
-规则：
+规则（三池价格杠杆，架构 §4.3）：
 - 按卡·时计价，base 单价 × 卡型倍率（B3 > B4，异构差异定价）
-- Guaranteed 全价；Preemptible 折价（如 4 折）
+- 全价：GUARANTEED（在线）/ PROTECTED（离线配额内）/ BEST_EFFORT_FIXED（固定池）
+- 折价：PREEMPTIBLE（弹性/突发池，如 4 折）—— 想省钱就把活推进突发池
 - Preemptible 被抢占的那段时间不计费（否则没人愿标可抢占）
 
 调度核心每次绑卡/释放上报 UsageEvent，本服务累计成本。
@@ -39,7 +40,7 @@ class MeteringService:
     def _qos_factor(self, qos: QoS) -> float:
         if qos == QoS.PREEMPTIBLE:
             return self.config.preemptible_discount
-        return 1.0  # Guaranteed / BestEffort-Fixed 全价
+        return 1.0  # GUARANTEED / PROTECTED / BEST_EFFORT_FIXED 全价
 
     def cost_of(self, ev: UsageEvent) -> float:
         billable_seconds = ev.seconds
