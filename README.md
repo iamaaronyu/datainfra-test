@@ -1,98 +1,104 @@
-# 算力服务化平台 — 混部调度核心（可运行实现）
+# datainfra-test — NPU 算力服务化 / 统一推理算力池 参考实现
 
-> **最新方向（v2）**：按《[NPU统一推理算力池需求说明_v2](./docs/20-NPU统一推理算力池_需求_v2.md)》，
-> 问题已从"两类业务抢卡"重定位为"统一多模型推理算力池"。重新设计的实现见
-> `src/inference_pool/`，设计说明见《[NPU统一推理算力池设计_v2](./docs/21-NPU统一推理算力池_设计_v2.md)》。
-> 下方 `compute_platform` 为旧实现，其幂等分片队列被新实现复用，三池配额/抢占等模块已标注 deprecated。
+不依赖昇腾硬件即可全量测试的策略内核参考实现。仓库包含**两代设计**及其可运行代码：
 
-## inference_pool（v2 新实现）
+- **v2（最新）`inference_pool`** — 按《[NPU 统一推理算力池需求 v2](./docs/20-NPU统一推理算力池_需求_v2.md)》，
+  把问题从"两类业务抢卡"重定位为**统一多模型推理算力池**。
+- **v1（旧）`compute_platform`** — 按《[算力服务化平台架构设计 v2.0](./docs/11-算力服务化平台_架构设计_v2.0.md)》，
+  面向离线批处理的"三池配额 + 搬卡抢占"调度核心。其幂等分片队列被 v2 复用，配额/抢占类模块已标注 deprecated。
 
-| 需求层 | 模块 |
-|---|---|
-| 推理混跑（GLM5.1 单部署、在线插队 + 批量填谷） | `inference_pool.gateway` |
-| 在线副本自动扩缩（64–3000、温卡优先、预热、缩容迟滞） | `inference_pool.autoscaler` + `inference_pool.card_pool` |
-| 多模型离线编排（换装聚合 + 幂等分片续跑 + deadline） | `inference_pool.offline_pool` |
-| prefix/KV cache 亲和路由（Claude Code 专项） | `inference_pool.cache_affinity` |
-| 顶层控制回路 | `inference_pool.platform` |
+> 为什么有两代？需求澄清后问题性质变了：在线(Claude Code 调 GLM5.1)与离线批量**本质是同一种推理负载**，
+> 是正和而非零和。详见《[NPU 统一推理算力池设计 v2](./docs/21-NPU统一推理算力池_设计_v2.md)》§1。
 
 ---
 
-## compute_platform（旧实现，离线批处理子集仍复用）
+## 文档（`docs/`）
 
-按《[算力服务化平台架构设计v2.0](./docs/11-算力服务化平台_架构设计_v2.0.md)》实现的离线批处理 + 调度核心（自研混部薄层的策略内核参考实现），
-不依赖昇腾硬件即可全量测试。真实环境组件在此用替身：
+命名规范 `编号-产品名_类型_版本.md`：`10/11/12` 为旧套，`20/21` 为新套。
 
-| 真实组件 | 本实现替身 |
-|---|---|
-| vLLM-Ascend / MindIE | `inference.MockEngine`（本地 in-process generate） |
-| 统一对象存储 | `objectstore.LocalObjectStore`（原子写 + range read） |
-| Redis / PostgreSQL 队列 | `queue.SqliteShardQueue`（BEGIN IMMEDIATE 原子 claim + 租约） |
-| Volcano / KEDA | `scheduler.controller` / `scheduler.preemption` / `scheduler.pools`（纯函数策略） |
-| DataHub（血缘/版本/region） | `governance.lineage.LineageRegistry`（进程内版本链） |
+| 文档 | 归属 | 说明 |
+|---|---|---|
+| [10-数据工程平台_需求_v2.0](./docs/10-数据工程平台_需求_v2.0.md) | v1 | 旧需求基线 |
+| [11-算力服务化平台_架构设计_v2.0](./docs/11-算力服务化平台_架构设计_v2.0.md) | v1 | 旧总体/架构设计 |
+| [12-算力服务化平台_详细设计_v1.0](./docs/12-算力服务化平台_详细设计_v1.0.md) | v1 | 旧详细设计（对应 `compute_platform`） |
+| [20-NPU统一推理算力池_需求_v2](./docs/20-NPU统一推理算力池_需求_v2.md) | **v2** | **最新需求**（R1–R5 + §5 八大场景 + §10 差异说明） |
+| [21-NPU统一推理算力池_设计_v2](./docs/21-NPU统一推理算力池_设计_v2.md) | **v2** | **最新技术设计**（模块划分 + 需求↔代码↔测试映射） |
 
-详尽设计见《[算力服务化平台详细设计v1.0](./docs/12-算力服务化平台_详细设计_v1.0.md)》。
+**建议阅读顺序**：先 `20`（要什么）→ 再 `21`（怎么做、怎么落到代码）。
+
+---
+
+## 代码（`src/`）
+
+### v2：`inference_pool` —— 统一推理算力池（最新实现）
+
+三层架构（消解了旧需求 ~80% 复杂度），由 `platform.py` 串成一个控制回路：
+
+| 模块 | 职责 | 对应需求 |
+|---|---|---|
+| [`models.py`](./src/inference_pool/models.py) | 领域模型：卡角色状态机 / 优先级 / 模型规格 / 分片任务 | — |
+| [`gateway.py`](./src/inference_pool/gateway.py) | **推理混跑层**：GLM5.1 单部署，在线请求实时插队、批量填谷，连续批处理，**不搬卡** | R1 |
+| [`autoscaler.py`](./src/inference_pool/autoscaler.py) | **在线副本自动扩缩**：64–3000 卡，负载驱动 + 预测预热 + 缩容迟滞 | R2 |
+| [`card_pool.py`](./src/inference_pool/card_pool.py) | **卡池状态机**：温卡优先回收（秒级）→ 换装（分钟级）递进 | R2/§3 |
+| [`offline_pool.py`](./src/inference_pool/offline_pool.py) | **多模型离线编排**：换装聚合 + 幂等分片续跑 + deadline（复用 `compute_platform.queue`） | R3/R5 |
+| [`cache_affinity.py`](./src/inference_pool/cache_affinity.py) | **prefix/KV cache 亲和路由**（Claude Code 专项） | R4 |
+| [`platform.py`](./src/inference_pool/platform.py) | 顶层控制回路，保证"在线 SLA 优先"硬不变量 | §3/§5 |
+
+### v1：`compute_platform` —— 旧离线批处理调度核心
+
+```
+src/compute_platform/
+├── models.py / config.py / registry.py   领域模型 · 配置 · 模型注册表
+├── objectstore.py                        对象存储（原子写 + range read）
+├── sharder.py                            切分器（切指针不切数据、可重入）
+├── inference.py / worker.py              推理引擎抽象 + 离线 worker 主循环
+├── queue/                                幂等分片队列 + 租约 ★ v2 复用此件
+├── scheduler/                            调度策略（纯函数）
+│   ├── controller.py · locality.py       弹性伸缩 · 数据局部性约束（仍有效）
+│   └── pools.py · preemption.py · fairshare.py   三池/抢占/公平分配（⚠ deprecated）
+├── governance/                           治理：quota(⚠ deprecated) · metering · lineage
+└── batch_api/                            离线作业 FastAPI 接入
+```
+
+> `scheduler/{pools,preemption,fairshare}.py` 与 `governance/quota.py` 是旧"业务百分比配额 +
+> 搬卡抢占"模型，已在 docstring 标注 deprecated；v2 改由 autoscaler 定在线副本数、推理层优先级混跑。
+
+---
 
 ## 运行
 
 ```bash
-# 复用任意装有 fastapi/pydantic/httpx/pytest 的 venv
+# 装依赖（任意装有 fastapi/pydantic/httpx/pytest 的 venv 均可）
 python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 
-# 全量测试（64 用例）
+# 全量测试（137 用例：旧 102 + 新 35）
 python -m pytest
 
-# 端到端 demo（进程内拉起全链路：提交→切分→4 worker 并发→100%→计量）
+# 只跑 v2 统一推理算力池
+python -m pytest tests/inference_pool
+
+# v1 端到端 demo（进程内拉起全链路：提交→切分→4 worker 并发→100%→计量）
 python examples/quickstart.py
 
-# 启动离线任务 API（端口 8090）
+# v1 离线任务 API（端口 8090）
 python -m uvicorn examples.serve:app --port 8090   # 见 examples/serve.py
 ```
 
-## 代码结构
+---
 
-```
-src/compute_platform/
-├── config.py            # 配置（CP_ 前缀）：租约/粒度/门槛 K/计价
-├── models.py            # 领域模型：QoS · CardType · Job · Shard · ModelSpec
-├── objectstore.py       # 对象存储：原子写、range read
-├── registry.py          # 模型注册表：模型→卡型/加载耗时/吞吐/占卡
-├── sharder.py           # 切分器：切指针不切数据、粒度反推、可重入
-├── inference.py         # 推理引擎抽象 + MockEngine（§4.4 扩展点）
-├── worker.py            # 离线 worker 主循环（嵌入式推理、幂等提交）
-├── queue/               # 分片队列 + 租约（系统心脏）
-│   ├── base.py          #   接口：claim/renew/commit/abort/fail/reap...
-│   └── sqlite_queue.py  #   SQLite 实现（Redis/PG 的替身）
-├── scheduler/           # 调度核心（纯函数，便于测试）
-│   ├── controller.py    #   弹性伸缩：desired=min(积压,供给,配额)+加载门槛+末班车
-│   ├── preemption.py    #   抢占 victim 选择：只抢突发池、先小后大、护新大实例
-│   ├── pools.py         #   三池模型（决策三）：在线保障/离线配额/弹性突发 + 配额打标
-│   ├── locality.py      #   数据局部性硬约束：PB 不跨域、强制就近
-│   └── fairshare.py     #   跨产线加权公平分配（注水法、整数守恒）
-├── governance/          # 治理
-│   ├── quota.py         #   多租户卡级配额硬边界
-│   ├── metering.py      #   差异计量：卡型差价 + 突发折扣 + 被抢不计费
-│   └── lineage.py       #   DataHub 替身：版本链 + 端到端血缘 + region
-└── batch_api/           # 离线作业接入（服务化边界=任务提交，非每次推理）
-    ├── service.py       #   提交/进度/错误/取消/重试 + JobStore + 幂等
-    │                    #   + 数据局部性强制 + 完成回写血缘(task×DataHub 闭环)
-    └── app.py           #   FastAPI 五接口
-```
+## 测试覆盖
 
-## 测试覆盖（102 用例全绿）
+### v2 `tests/inference_pool/`（35 用例）
 
 | 文件 | 覆盖 |
 |---|---|
-| test_objectstore | 原子写、range read、防逃逸、覆盖幂等 |
-| test_queue | 幂等入队、原子 claim、租约过期回收、CAS commit、fail→死信、abort、取消、模型隔离 |
-| test_sharder | 指针分片、粒度反推、范围正确、确定性 |
-| test_worker | 全量处理、幂等覆盖、毒分片→死信、优雅退出 |
-| test_controller | 积压/供给/配额三约束、加载成本门槛、潮汐末班车 |
-| test_preemption | 不抢 Guaranteed/Protected/Fixed、先小后大、护新大实例、三池只抢超配额 |
-| test_pools | 三池容量约束、配额内/跨界/超配打标、排空余量、负值防御 |
-| test_locality | 就近放置、本域故障拦截跨域、显式放行、缺 region 拒绝 |
-| test_fairshare | 按权重比例、want 封顶再分配、整数守恒、零卡/零权重 |
-| test_lineage | 版本登记、父版本校验、多轮链路回溯、latest、复现校验、跨产线多父 |
-| test_governance | 配额 reserve/release/超限、差异计价、Protected 全价、被抢不计费、按租户结算 |
-| test_batch_api | 提交、未知模型 400、配额 429、幂等 token、进度、错误/重试、取消、404 |
-| test_service_governance | 局部性拦截/放行、缺父版本拒绝、两轮血缘闭环、未完成禁 complete |
-| test_end_to_end | 单 worker 全链路、抢占后续跑不丢、4 worker 并发无重复无丢失 |
+| test_gateway | 在线优先级插队、批量填谷、不被批量饿死、高峰压批量、过载信号 |
+| test_autoscaler | QPS/队列深度驱动、上下限夹取、TTFT 追加、扩容即时、缩容迟滞、预测预热 |
+| test_card_pool | 温卡优先回收、换装时序、缩容回流温卡、缺口处理、在线不变量 |
+| test_cache_affinity | 冷会话 miss→后续 hit、粘性路由、缩容仅失效被移除副本、无会话不亲和 |
+| test_offline_pool | 幂等入队、卡型成组、派发提交、drain 续跑、回收退还分片、deadline 排序 |
+| test_scenarios | **端到端逐一对应需求 §5.1–5.8 八大场景** |
+
+### v1 `tests/`（102 用例）
+
+队列 / 切分 / worker / 控制器 / 抢占 / 三池 / 局部性 / 公平分配 / 血缘 / 计量 / 配额 / batch_api / 端到端，详见各 `test_*.py`。
