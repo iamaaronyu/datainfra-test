@@ -1,4 +1,23 @@
-# 算力服务化平台 — 混部调度核心（设计 v1.0 的可运行实现）
+# 算力服务化平台 — 混部调度核心（可运行实现）
+
+> **最新方向（v2）**：按《[NPU统一推理算力池需求说明_v2](./docs/NPU统一推理算力池需求说明_v2.md)》，
+> 问题已从"两类业务抢卡"重定位为"统一多模型推理算力池"。重新设计的实现见
+> `src/inference_pool/`，设计说明见《[NPU统一推理算力池设计_v2](./docs/NPU统一推理算力池设计_v2.md)》。
+> 下方 `compute_platform` 为旧实现，其幂等分片队列被新实现复用，三池配额/抢占等模块已标注 deprecated。
+
+## inference_pool（v2 新实现）
+
+| 需求层 | 模块 |
+|---|---|
+| 推理混跑（GLM5.1 单部署、在线插队 + 批量填谷） | `inference_pool.gateway` |
+| 在线副本自动扩缩（64–3000、温卡优先、预热、缩容迟滞） | `inference_pool.autoscaler` + `inference_pool.card_pool` |
+| 多模型离线编排（换装聚合 + 幂等分片续跑 + deadline） | `inference_pool.offline_pool` |
+| prefix/KV cache 亲和路由（Claude Code 专项） | `inference_pool.cache_affinity` |
+| 顶层控制回路 | `inference_pool.platform` |
+
+---
+
+## compute_platform（旧实现，离线批处理子集仍复用）
 
 按《[算力服务化平台架构设计v2.0](./docs/算力服务化平台架构设计v2.0.md)》实现的离线批处理 + 调度核心（自研混部薄层的策略内核参考实现），
 不依赖昇腾硬件即可全量测试。真实环境组件在此用替身：

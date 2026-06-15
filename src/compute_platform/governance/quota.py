@@ -2,6 +2,10 @@
 
 入队时校验：超额排队/降级。这里实现卡数硬边界 reserve/release，
 对应 Volcano 队列 capability 的兜底语义。
+
+.. deprecated:: NPU 统一推理算力池 v2
+    新需求不再用"业务百分比/租户卡配额"做在线-离线分配（v2 §10）；在线由 autoscaler
+    按负载定副本数，离线吞吐由空泡填谷 + 常驻池自然兜底。仅旧 compute_platform 仍用本模块。
 """
 from __future__ import annotations
 

@@ -1,5 +1,12 @@
 """抢占 victim 选择（架构 §4.3，决策三 / 三池模型）。
 
+.. deprecated:: NPU 统一推理算力池 v2
+    本模块属"搬卡式抢占"模型。按《docs/NPU统一推理算力池需求说明_v2》§10，
+    GLM5.1 在线/离线靠推理层优先级混跑、不发生搬卡，抢占顺序整体移除。新实现见
+    ``inference_pool``（混跑由 ``gateway`` 承担，扩容由 ``card_pool`` 的温卡回收+换装承担）。
+    本模块仅为旧 compute_platform 离线批处理保留，勿用于新需求。
+
+
 早高峰在线扩容需要卡时，**只从弹性/突发池（Preemptible）** 选牺牲者：
 - 只选 Preemptible（GUARANTEED 在线、PROTECTED 离线配额内、BEST_EFFORT_FIXED 固定池都不抢）
 - 优先杀小实例（碎卡好回收、加载便宜）
